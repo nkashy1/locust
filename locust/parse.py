@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import cast, Dict, List, Optional, Tuple, Union
 
 from google.protobuf.json_format import MessageToDict, Parse, ParseDict
 from pydantic import BaseModel
@@ -31,6 +31,8 @@ class ContextType(Enum):
     CLASS_DEF = "class"
     DEPENDENCY = "dependency"
     USAGE = "usage"
+    EXCEPTION_CATCH = "exception_catch"
+    EXCEPTION_RAISE = "exception_raise"
 
 
 @dataclass
@@ -44,12 +46,28 @@ class Scope:
     symbols: Dict[str, List[str]] = field(default_factory=dict)
 
 
+@dataclass
+class ExceptionHandler:
+    lineno: int
+    exception_type: Optional[str] = None
+    exception_name: Optional[str] = None
+    end_lineno: Optional[int] = None
+
+
+@dataclass
+class TryBlock:
+    handlers: List[ExceptionHandler]
+    lineno: int
+    end_lineno: Optional[int] = None
+
+
 class LocustVisitor(ast.NodeVisitor):
     def __init__(self):
         self.scope: List[Scope] = []
         self.definitions: List[RawDefinition] = []
         self.context_type: ContextType = ContextType.UNKNOWN
         self.global_symbols: Dict[str, List[str]] = {}
+        self.try_blocks: List[TryBlock] = []
 
     def _current_symbols(self) -> Dict[str, List[str]]:
         if self.scope:
@@ -65,11 +83,16 @@ class LocustVisitor(ast.NodeVisitor):
             symbols[symbol] = []
         symbols[symbol].append(qualification)
 
-    def _prune_scope(self, lineno: int) -> None:
+    def _prune(self, lineno: int) -> None:
         self.scope = [
             spec
             for spec in self.scope
-            if spec.end_lineno is not None and spec.end_lineno > lineno
+            if spec.end_lineno is None or spec.end_lineno >= lineno
+        ]
+        self.try_blocks = [
+            spec
+            for spec in self.try_blocks
+            if spec.end_lineno is None or spec.end_lineno >= lineno
         ]
 
     def _current_scope_parent(self) -> Optional[DefinitionParent]:
@@ -85,7 +108,7 @@ class LocustVisitor(ast.NodeVisitor):
         self,
         node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
     ) -> None:
-        self._prune_scope(node.lineno)
+        self._prune(node.lineno)
         self.scope.append(
             Scope(
                 name=node.name,
@@ -118,12 +141,13 @@ class LocustVisitor(ast.NodeVisitor):
         self._visit_class_or_function_def(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        print(node)
         self.context_type = ContextType.CLASS_DEF
         self._visit_class_or_function_def(node)
 
     def visit_Import(self, node: ast.Import) -> None:
         self.context_type = ContextType.DEPENDENCY
-        self._prune_scope(node.lineno)
+        self._prune(node.lineno)
         parent = self._current_scope_parent()
         for alias in node.names:
             signifier = alias.asname if alias.asname is not None else alias.name
@@ -143,7 +167,7 @@ class LocustVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         self.context_type = ContextType.DEPENDENCY
-        self._prune_scope(node.lineno)
+        self._prune(node.lineno)
         parent = self._current_scope_parent()
         module_name = node.module
         dots = "" if not node.level else "." * node.level
@@ -222,6 +246,56 @@ class LocustVisitor(ast.NodeVisitor):
                         parent=parent,
                     )
                     self.definitions.append(definition)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self.context_type = ContextType.EXCEPTION_CATCH
+        self._prune(node.lineno)
+        self.scope.append(
+            Scope(
+                name="TRY",
+                lineno=node.lineno,
+                end_lineno=node.end_lineno,
+                symbols=self._current_symbols(),
+            )
+        )
+        parent = self._current_scope_parent()
+
+        handlers: List[ExceptionHandler] = []
+        for handler in node.handlers:
+            if handler.type is None:
+                handlers.append(
+                    ExceptionHandler(
+                        lineno=handler.lineno, end_lineno=handler.end_lineno
+                    )
+                )
+            else:
+                handler_type = "UNKNOWN"
+                if type(handler.type) == ast.Name:
+                    handler_type = cast(ast.Name, handler.type).id
+                handlers.append(
+                    ExceptionHandler(
+                        exception_type=handler_type,
+                        exception_name=handler.name,
+                        lineno=handler.lineno,
+                        end_lineno=handler.end_lineno,
+                    )
+                )
+
+            definition = RawDefinition(
+                name=handler_type,
+                change_type=self.context_type.value,
+                line=handler.lineno,
+                offset=handler.col_offset,
+                end_line=handler.end_lineno,
+                end_offset=handler.end_col_offset,
+                parent=parent,
+            )
+            self.definitions.append(definition)
+
+        try_block = TryBlock(
+            handlers=handlers, lineno=node.lineno, end_lineno=node.end_lineno
+        )
+        self.try_blocks.append(try_block)
 
     def reset(self):
         self.scope = []
